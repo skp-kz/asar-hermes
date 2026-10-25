@@ -8,12 +8,13 @@ Protocol (docs/agent-link-protocol.md in skp-kz/asar):
   agent → Asar: {type:"ack", cursor} · {type:"post", ref, channel_id, text} · {type:"status", state} · {type:"ping"}
 Env (``~/.hermes/.env``): ASAR_KEY (required), ASAR_URL, ASAR_WAKE_ON (mention|all), ASAR_HOME_CHANNEL,
 ASAR_ALLOW_ALL_USERS (the installer sets it to true: who may write to the agent is decided in Asar).
-Uses the ``websockets`` package that ships with Hermes.
+Uses the ``websockets`` package that ships with Hermes. Works with Hermes from Aug 2026 onwards (no gateway.platforms._shared).
 """
 
 import asyncio
 import contextlib
 import datetime
+import inspect
 import json
 import logging
 import os
@@ -24,11 +25,32 @@ import urllib.request
 import zipfile
 from typing import Any, Dict, Optional
 
-from gateway.platforms._shared import get_scoped_secret as _secret, seed_extra_from_env as _seed, send_error
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.platforms.event import MessageEvent, MessageType
-from gateway.platforms.helpers import MessageDeduplicator, cancel_task
+try:  # новые версии
+    from gateway.platforms.event import MessageEvent, MessageType
+except ImportError:  # старые: реэкспорт из base
+    from gateway.platforms.base import MessageEvent, MessageType
 from gateway.config import Platform
+try:
+    from gateway.platforms.helpers import MessageDeduplicator
+except ImportError:
+    MessageDeduplicator = None
+
+# --- секреты: новый _shared или старый agent.secret_scope, иначе os.environ ---
+try:
+    from gateway.platforms._shared import get_scoped_secret as _secret
+except ImportError:
+    try:
+        from agent.secret_scope import UnscopedSecretError as _Unscoped, get_secret as _scoped_get
+        def _secret(name, default=""):
+            try:
+                v = _scoped_get(name, default)
+            except _Unscoped:
+                v = os.environ.get(name, default)
+            return v if v is not None else default
+    except ImportError:
+        def _secret(name, default=""):
+            return os.environ.get(name, default)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +60,7 @@ BACKLOG_MINUTES = 30  # events older than this (queued while the gateway was dow
 
 
 def _env_or_extra(extra: dict, env: str, key: str, default: Any = "") -> Any:
-    return _secret(env) or extra.get(key, default)
+    return _secret(env, "") or extra.get(key, default)
 
 
 def _ws_url(base: str, key: str) -> str:
@@ -58,6 +80,27 @@ def _age_minutes(ts: Optional[str]) -> float:
         return 0.0
 
 
+async def _cancel(task: Optional[asyncio.Task]) -> None:
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+class _Dedup:
+    """Запасной дедупликатор, если в этой версии нет helpers.MessageDeduplicator."""
+    def __init__(self, ttl_seconds=600):
+        self.ttl = ttl_seconds; self.seen: Dict[str, float] = {}
+    def is_duplicate(self, mid: str) -> bool:
+        now = time.time()
+        for k in [k for k, t in self.seen.items() if now - t > self.ttl]:
+            self.seen.pop(k, None)
+        if mid in self.seen:
+            return True
+        self.seen[mid] = now
+        return False
+
+
 class AsarAdapter(BasePlatformAdapter):
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("asar"))
@@ -69,7 +112,7 @@ class AsarAdapter(BasePlatformAdapter):
         self._task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
         self._closed = False
-        self._dedup = MessageDeduplicator(ttl_seconds=600)
+        self._dedup = (MessageDeduplicator or _Dedup)(ttl_seconds=600)
         self._channels: Dict[str, dict] = {}
         self._agent: dict = {}
         self._ref = 0
@@ -79,18 +122,23 @@ class AsarAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Asar"
 
+    def _fatal(self, code: str, msg: str, retryable: bool) -> bool:
+        if hasattr(self, "_set_fatal_error"):
+            self._set_fatal_error(code, msg, retryable=retryable)
+        else:
+            logger.error("Asar: %s — %s", code, msg)
+        return False
+
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.key:
-            self._set_fatal_error("config_missing", "ASAR_KEY is not set (run the Asar installer with a code)", retryable=False)
-            return False
-        if not self._acquire_platform_lock("asar", self.key[-12:], "Asar agent key"):
+            return self._fatal("config_missing", "ASAR_KEY is not set (run the Asar installer with a code)", False)
+        if hasattr(self, "_acquire_platform_lock") and not self._acquire_platform_lock("asar", self.key[-12:], "Asar agent key"):
             return False
         try:
             import websockets  # bundled with Hermes
         except ImportError:
-            self._set_fatal_error("deps_missing", "websockets package is missing", retryable=False)
-            return False
+            return self._fatal("deps_missing", "websockets package is missing", False)
         self._closed = False
         ready: asyncio.Future = asyncio.get_running_loop().create_future()
         self._task = asyncio.create_task(self._run(websockets, ready))
@@ -100,23 +148,25 @@ class AsarAdapter(BasePlatformAdapter):
             ok = False
         if not ok:
             await self.disconnect()
-            self._set_fatal_error("connect_failed", "Asar did not answer hello in 30 s", retryable=True)
-            return False
+            return self._fatal("connect_failed", "Asar did not answer hello in 30 s", True)
         self._mark_connected()
-        self._wire_plugin_handlers(None)
+        if hasattr(self, "_wire_plugin_handlers"):
+            with contextlib.suppress(Exception):
+                self._wire_plugin_handlers(None)
         logger.info("Asar: connected as %s (%s), channels: %d", self._agent.get("name"), self._agent.get("id"), len(self._channels))
         return True
 
     async def disconnect(self) -> None:
         self._closed = True
-        with contextlib.suppress(Exception):
-            self._release_platform_lock()
+        if hasattr(self, "_release_platform_lock"):
+            with contextlib.suppress(Exception):
+                self._release_platform_lock()
         self._mark_disconnected()
         if self._ws:
             with contextlib.suppress(Exception):
                 await self._ws.close(1000, "stop")
-        await cancel_task(self._ping_task)
-        await cancel_task(self._task)
+        await _cancel(self._ping_task)
+        await _cancel(self._task)
         self._ws = None
 
     # ── socket loop with reconnect ───────────────────────────────────────────
@@ -136,13 +186,15 @@ class AsarAdapter(BasePlatformAdapter):
                 code = getattr(e, "code", None) or getattr(getattr(e, "rcvd", None), "code", None)
                 if code == 4401:
                     logger.error("Asar: key revoked — reissue a code in Asar → Agents")
-                    self._set_fatal_error("key_revoked", "Asar key revoked", retryable=False)
-                    await self._notify_fatal_error()
+                    self._fatal("key_revoked", "Asar key revoked", False)
+                    if hasattr(self, "_notify_fatal_error"):
+                        with contextlib.suppress(Exception):
+                            await self._notify_fatal_error()
                     return
                 logger.warning("Asar: socket closed (%s), reconnecting", e)
             finally:
                 self._ws = None
-                await cancel_task(self._ping_task)
+                await _cancel(self._ping_task)
                 self._ping_task = None
                 for f in self._pending.values():
                     if not f.done():
@@ -193,7 +245,7 @@ class AsarAdapter(BasePlatformAdapter):
 
     # ── inbound ──────────────────────────────────────────────────────────────
     async def _on_message(self, m: dict) -> None:
-        if not self._message_handler:
+        if not getattr(self, "_message_handler", None):
             return
         mid = str(m.get("id"))
         if self._dedup.is_duplicate(mid):
@@ -211,12 +263,15 @@ class AsarAdapter(BasePlatformAdapter):
             return
         source = self.build_source(chat_id=ch.get("id", ""), chat_name=ch.get("name", ""), chat_type="dm" if is_dm else "group",
                                    user_id=frm.get("id", ""), user_name=frm.get("name", ""))
-        await self.handle_message(MessageEvent(text=text, message_type=MessageType.TEXT, source=source, message_id=mid,
-                                               timestamp=datetime.datetime.now()))
+        kw = {"text": text, "message_type": MessageType.TEXT, "source": source, "message_id": mid}
+        with contextlib.suppress(Exception):
+            if "timestamp" in inspect.signature(MessageEvent).parameters:
+                kw["timestamp"] = datetime.datetime.now()
+        await self.handle_message(MessageEvent(**kw))
 
     # ── outbound ─────────────────────────────────────────────────────────────
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
-                   metadata: Optional[Dict[str, Any]] = None):
+                   metadata: Optional[Dict[str, Any]] = None, **kwargs):
         if not self._ws:
             return SendResult(success=False, error="Not connected")
         last_id = None
@@ -234,7 +289,7 @@ class AsarAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(e))
         return SendResult(success=True, message_id=str(last_id) if last_id is not None else None)
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
+    async def send_typing(self, chat_id: str, metadata=None, **kwargs) -> None:
         with contextlib.suppress(Exception):
             await self._send({"type": "status", "state": "working"})
 
@@ -328,19 +383,27 @@ def is_connected(config) -> bool:
 
 
 def _env_enablement() -> dict | None:
-    key = _secret("ASAR_KEY", "").strip()
+    key = (_secret("ASAR_KEY", "") or "").strip()
     if not key:
         return None
-    return {"key": key, **_seed((("ASAR_URL", "url", None), ("ASAR_WAKE_ON", "wake_on", None)), home_env="ASAR_HOME_CHANNEL")}
+    out = {"key": key}
+    for env, k in (("ASAR_URL", "url"), ("ASAR_WAKE_ON", "wake_on")):
+        v = (_secret(env, "") or "").strip()
+        if v:
+            out[k] = v
+    home = (_secret("ASAR_HOME_CHANNEL", "") or "").strip()
+    if home:
+        out["home_channel"] = {"chat_id": home, "name": "Home"}
+    return out
 
 
-async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id=None, media_files=None, force_document=False) -> Dict[str, Any]:
+async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id=None, media_files=None, force_document=False, **kwargs) -> Dict[str, Any]:
     """Cron delivery without the live gateway: plain HTTP POST with the agent key."""
     extra = getattr(pconfig, "extra", {}) or {}
     key = _env_or_extra(extra, "ASAR_KEY", "key", "")
     url = (_env_or_extra(extra, "ASAR_URL", "url", DEFAULT_URL) or DEFAULT_URL).rstrip("/")
     if not key or not chat_id:
-        return send_error("Asar standalone send: ASAR_KEY and chat_id required")
+        return {"success": False, "error": "Asar standalone send: ASAR_KEY and chat_id required"}
     try:
         rq = urllib.request.Request(f"{url}/api/channels/{chat_id}/messages", method="POST",
                                     data=json.dumps({"body": message}).encode(),
@@ -348,11 +411,11 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id=Non
         body = json.loads(urllib.request.urlopen(rq, timeout=20).read() or b"{}")
         return {"success": True, "message_id": str(body.get("id", ""))}
     except Exception as e:
-        return send_error(f"Asar standalone send failed: {e}")
+        return {"success": False, "error": f"Asar standalone send failed: {e}"}
 
 
 def register(ctx):
-    ctx.register_platform(
+    wanted = dict(
         name="asar",
         label="Asar",
         adapter_factory=AsarAdapter,
@@ -375,3 +438,11 @@ def register(ctx):
             "Markdown is supported. In a channel with several agents you are addressed by @name; answer only what "
             "concerns you, briefly, in the language the person writes in."),
     )
+    # разные версии Hermes знают разный набор параметров — отдаём только известные
+    try:
+        params = inspect.signature(ctx.register_platform).parameters
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            wanted = {k: v for k, v in wanted.items() if k in params}
+    except (TypeError, ValueError):
+        pass
+    ctx.register_platform(**wanted)
