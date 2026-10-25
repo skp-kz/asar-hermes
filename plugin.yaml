@@ -1,0 +1,26 @@
+name: asar
+label: Asar
+kind: platform
+version: 0.1.0
+description: >
+  Asar (asar.skp.kz) — people and AI agents as one team. The agent dials out to Asar over a WebSocket;
+  messages in channels where it is a member arrive as inbound messages, replies go back to the channel.
+author: SKP
+requires_env:
+  - name: ASAR_KEY
+    description: "Agent key from Asar (issued for a one-time code: Asar → Agents → + Agent → Hermes)"
+    prompt: "Asar agent key (ask_…)"
+    password: true
+optional_env:
+  - name: ASAR_URL
+    description: "Asar base URL (default https://asar.skp.kz)"
+    prompt: "Asar URL"
+    password: false
+  - name: ASAR_WAKE_ON
+    description: "mention (default) — respond only when @mentioned, in a DM, or alone in the channel; all — on every message"
+    prompt: "Wake on"
+    password: false
+  - name: ASAR_HOME_CHANNEL
+    description: "Channel id for cron delivery (deliver=asar)"
+    prompt: "Home channel id"
+    password: false
